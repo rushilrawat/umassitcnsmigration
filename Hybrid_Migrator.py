@@ -8,28 +8,43 @@ Strategy:
   1. Try WP REST API (/wp-json/wp/v2/posts) — clean JSON, best data
   2. Fall back to HTML archive scraping if API is blocked/disabled
 
-Output:  vierling_posts.csv   (ready to import via WP All Import or similar)
-Columns: post_title, post_content, post_excerpt, post_date, post_status,
-         post_name (slug), featured_image_url, categories, tags
+Image handling:
+  - Downloads EVERY image referenced in post content + featured images
+  - Saves them to ./images/<slug>/ locally
+  - Rewrites all <img src="..."> in post_content to use local paths
+  - CSV column featured_image_local points to the local file
+
+Output files:
+  vierling_posts.csv   — ready to import via WP All Import
+  images/              — all downloaded images, organised by post slug
+  failed_urls.txt      — any posts that couldn't be fetched (if any)
+  failed_images.txt    — any images that couldn't be downloaded (if any)
 """
 
 import csv
+import os
+import re
 import time
+import hashlib
+import mimetypes
 import requests
 import pandas as pd
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
-BASE        = "https://sites.biochem.umass.edu/vierlinglab"
-API_BASE    = f"{BASE}/wp-json/wp/v2"
-OUTPUT_CSV  = "vierling_posts.csv"
-DELAY       = 0.4          # seconds between requests (be polite)
-TIMEOUT     = 20           # seconds per request
-YEAR_START  = 2011
-YEAR_END    = 2025
-MAX_RETRIES = 3
+BASE         = "https://sites.biochem.umass.edu/vierlinglab"
+API_BASE     = f"{BASE}/wp-json/wp/v2"
+OUTPUT_CSV   = "vierling_posts.csv"
+IMAGES_DIR   = Path("images")
+DELAY        = 0.4          # seconds between requests (be polite)
+TIMEOUT      = 20           # seconds per request
+YEAR_START   = 2011
+YEAR_END     = 2025
+MAX_RETRIES  = 3
 
 HEADERS = {
     "User-Agent": (
@@ -39,9 +54,17 @@ HEADERS = {
     )
 }
 
+# Image extensions we bother saving
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp", ".tiff"}
+
+# ─── SETUP ───────────────────────────────────────────────────────────────────
+
+IMAGES_DIR.mkdir(exist_ok=True)
+failed_images = []
+
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 
-def get_with_retry(url, params=None, retries=MAX_RETRIES):
+def get_with_retry(url, params=None, retries=MAX_RETRIES, stream=False):
     """GET with exponential backoff on failure."""
     for attempt in range(retries):
         try:
@@ -49,7 +72,8 @@ def get_with_retry(url, params=None, retries=MAX_RETRIES):
                 url,
                 params=params,
                 headers=HEADERS,
-                timeout=TIMEOUT
+                timeout=TIMEOUT,
+                stream=stream
             )
             return r
         except requests.RequestException as e:
@@ -61,8 +85,114 @@ def get_with_retry(url, params=None, retries=MAX_RETRIES):
 
 
 def normalise_url(url):
-    """Ensure URL has no trailing double-slashes and uses https."""
+    """Strip trailing slashes, enforce https."""
     return url.strip().rstrip("/").replace("http://", "https://")
+
+
+def safe_filename(url):
+    """
+    Turn a URL into a safe local filename, preserving the original name
+    where possible and appending a short hash to avoid collisions.
+    """
+    parsed   = urlparse(url)
+    basename = os.path.basename(parsed.path)          # e.g. photo.jpg
+    name, ext = os.path.splitext(basename)
+
+    # If extension is missing or not an image ext, guess from content-type later
+    if not ext or ext.lower() not in IMAGE_EXTS:
+        ext = ".jpg"                                   # safe default
+
+    # Short hash to avoid name collisions across posts
+    short_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+    return f"{name}_{short_hash}{ext}"
+
+
+def download_image(url, dest_folder: Path):
+    """
+    Download a single image to dest_folder.
+    Returns the local file path (str) on success, or "" on failure.
+    """
+    if not url or not url.startswith("http"):
+        return ""
+
+    filename = safe_filename(url)
+    dest_path = dest_folder / filename
+
+    # Skip if already downloaded (re-run safe)
+    if dest_path.exists():
+        return str(dest_path)
+
+    r = get_with_retry(url, stream=True)
+    if r is None or r.status_code != 200:
+        failed_images.append(url)
+        return ""
+
+    # Fix extension from Content-Type if needed
+    content_type = r.headers.get("Content-Type", "")
+    if "jpeg" in content_type or "jpg" in content_type:
+        ext = ".jpg"
+    elif "png" in content_type:
+        ext = ".png"
+    elif "gif" in content_type:
+        ext = ".gif"
+    elif "webp" in content_type:
+        ext = ".webp"
+    elif "svg" in content_type:
+        ext = ".svg"
+    else:
+        ext = os.path.splitext(dest_path)[1] or ".jpg"
+
+    # Re-apply correct extension
+    dest_path = dest_folder / (dest_path.stem + ext)
+
+    try:
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+        return str(dest_path)
+    except OSError as e:
+        print(f"  ✗ Could not write {dest_path}: {e}")
+        failed_images.append(url)
+        return ""
+
+
+def download_all_images_in_content(content_html, slug, base_url=""):
+    """
+    Find every <img src> in the content HTML.
+    Download each image to images/<slug>/.
+    Rewrite the src to the local path.
+    Returns the rewritten HTML.
+    """
+    if not content_html:
+        return content_html
+
+    post_img_dir = IMAGES_DIR / slug
+    post_img_dir.mkdir(exist_ok=True)
+
+    soup = BeautifulSoup(content_html, "lxml")
+    imgs = soup.find_all("img")
+
+    for img in imgs:
+        src = img.get("src", "")
+        if not src:
+            continue
+
+        # Make absolute if relative
+        if src.startswith("//"):
+            src = "https:" + src
+        elif src.startswith("/"):
+            src = urljoin(base_url or BASE, src)
+        elif not src.startswith("http"):
+            src = urljoin(base_url or BASE, src)
+
+        local_path = download_image(src, post_img_dir)
+        if local_path:
+            img["src"] = local_path
+            # Also fix srcset if present
+            if img.get("srcset"):
+                img["srcset"] = ""   # clear it — local paths don't need srcset
+
+    return str(soup)
 
 
 # ─── STRATEGY 1: WP REST API ─────────────────────────────────────────────────
@@ -74,14 +204,13 @@ def fetch_via_api():
     """
     print("\n🔌 Trying WP REST API…")
 
-    # Quick probe
     probe = get_with_retry(f"{API_BASE}/posts", params={"per_page": 1})
     if probe is None or probe.status_code != 200:
         print("  API not reachable (status:", getattr(probe, "status_code", "N/A"), ")")
         return None
 
     try:
-        probe.json()  # make sure it's actually JSON
+        probe.json()
     except Exception:
         print("  API returned non-JSON — falling back to scraper.")
         return None
@@ -97,7 +226,7 @@ def fetch_via_api():
             params={
                 "per_page": 100,
                 "page":     page,
-                "_embed":   1,           # pulls featured image + terms inline
+                "_embed":   1,
                 "status":   "publish",
             }
         )
@@ -117,21 +246,31 @@ def fetch_via_api():
 def parse_api_post(p):
     """Extract every useful field from a single WP REST post object."""
 
+    slug = p.get("slug", "untitled")
+
     # ── Featured image ────────────────────────────────────────────────────────
-    featured_image = ""
+    featured_image_url = ""
     try:
-        media = p["_embedded"]["wp:featuredmedia"][0]
-        # Prefer full size, fall back to any available size
-        sizes = media.get("media_details", {}).get("sizes", {})
+        media  = p["_embedded"]["wp:featuredmedia"][0]
+        sizes  = media.get("media_details", {}).get("sizes", {})
         if sizes:
             for size in ("full", "large", "medium_large", "medium"):
                 if size in sizes:
-                    featured_image = sizes[size]["source_url"]
+                    featured_image_url = sizes[size]["source_url"]
                     break
-        if not featured_image:
-            featured_image = media.get("source_url", "")
+        if not featured_image_url:
+            featured_image_url = media.get("source_url", "")
     except (KeyError, IndexError, TypeError):
         pass
+
+    # Download featured image
+    post_img_dir = IMAGES_DIR / slug
+    post_img_dir.mkdir(exist_ok=True)
+    featured_image_local = download_image(featured_image_url, post_img_dir)
+
+    # ── Content — download all inline images & rewrite srcs ──────────────────
+    content_raw      = p.get("content", {}).get("rendered", "")
+    content_rewritten = download_all_images_in_content(content_raw, slug)
 
     # ── Categories & tags ─────────────────────────────────────────────────────
     categories, tags = [], []
@@ -153,21 +292,19 @@ def parse_api_post(p):
     except (KeyError, IndexError, TypeError):
         pass
 
-    # ── Content: strip <!-- wp:... --> block comments for clean HTML ──────────
-    content_raw = p.get("content", {}).get("rendered", "")
-
     return {
-        "post_title":         p.get("title", {}).get("rendered", ""),
-        "post_content":       content_raw,
-        "post_excerpt":       p.get("excerpt", {}).get("rendered", ""),
-        "post_date":          p.get("date", ""),          # "2024-06-15T10:30:00"
-        "post_status":        p.get("status", "publish"),
-        "post_name":          p.get("slug", ""),          # URL slug
-        "post_author":        author,
-        "featured_image_url": featured_image,
-        "categories":         ", ".join(categories),
-        "tags":               ", ".join(tags),
-        "original_url":       normalise_url(p.get("link", "")),
+        "post_title":            p.get("title", {}).get("rendered", ""),
+        "post_content":          content_rewritten,         # HTML with local img srcs
+        "post_excerpt":          p.get("excerpt", {}).get("rendered", ""),
+        "post_date":             p.get("date", ""),
+        "post_status":           p.get("status", "publish"),
+        "post_name":             slug,
+        "post_author":           author,
+        "featured_image_url":    featured_image_url,        # original URL (backup)
+        "featured_image_local":  featured_image_local,      # local file path
+        "categories":            ", ".join(categories),
+        "tags":                  ", ".join(tags),
+        "original_url":          normalise_url(p.get("link", "")),
     }
 
 
@@ -180,38 +317,33 @@ def fetch_via_scraper():
     """
     print("\n🕸  Falling back to HTML scraper…")
 
-    # Build every month URL from YEAR_START to YEAR_END
     archive_urls = [
         f"{BASE}/{year}/{month:02d}/"
         for year in range(YEAR_START, YEAR_END + 1)
         for month in range(1, 13)
     ]
 
-    seen_urls  = set()
-    post_urls  = []
+    seen_urls = set()
+    post_urls = []
 
-    # ── Pass 1: collect post URLs from archive pages ──────────────────────────
     print("  Pass 1: scanning archive pages…")
     for archive_url in tqdm(archive_urls, desc="Archives"):
         r = get_with_retry(archive_url)
         if r is None or r.status_code != 200:
             continue
 
-        soup = BeautifulSoup(r.text, "lxml")
+        soup     = BeautifulSoup(r.text, "lxml")
         articles = soup.select("article")
 
-        if not articles:                          # empty month — skip quietly
+        if not articles:
             continue
 
         for article in articles:
-            # Target the post permalink specifically (in the heading)
             link_tag = article.select_one(
-                ".entry-title a, h1.entry-title a, h2.entry-title a, "
-                "h1 a, h2 a, header a"
+                ".entry-title a, h1.entry-title a, h2.entry-title a, h1 a, h2 a, header a"
             )
             if not link_tag:
-                link_tag = article.find("a")      # last resort
-
+                link_tag = article.find("a")
             if not link_tag:
                 continue
 
@@ -226,8 +358,7 @@ def fetch_via_scraper():
 
     print(f"  Found {len(post_urls)} unique post URLs")
 
-    # ── Pass 2: scrape each post page ─────────────────────────────────────────
-    posts = []
+    posts  = []
     failed = []
 
     print("  Pass 2: scraping individual posts…")
@@ -254,6 +385,7 @@ def fetch_via_scraper():
 def scrape_post_page(html, url):
     """Parse a single post HTML page into a dict."""
     soup = BeautifulSoup(html, "lxml")
+    slug = url.rstrip("/").split("/")[-1]
 
     # Title
     title_tag = (
@@ -265,11 +397,11 @@ def scrape_post_page(html, url):
 
     # Date
     post_date = ""
-    time_tag = soup.find("time")
+    time_tag  = soup.find("time")
     if time_tag:
         post_date = time_tag.get("datetime", time_tag.get_text(strip=True))
 
-    # Content HTML
+    # Content
     content_el = (
         soup.select_one(".entry-content") or
         soup.select_one(".post-content") or
@@ -277,24 +409,32 @@ def scrape_post_page(html, url):
     )
     content_html = str(content_el) if content_el else ""
 
-    # Excerpt — first <p> inside content
+    # Excerpt
     excerpt = ""
     if content_el:
         first_p = content_el.find("p")
         if first_p:
             excerpt = first_p.get_text(strip=True)[:300]
 
-    # Featured image — og:image is the most reliable source
-    featured_image = ""
+    # Featured image — og:image first, then first img in content
+    featured_image_url = ""
     og = soup.find("meta", property="og:image")
     if og:
-        featured_image = og.get("content", "")
+        featured_image_url = og.get("content", "")
     elif content_el:
         img = content_el.find("img")
         if img:
-            featured_image = img.get("src", "")
+            featured_image_url = img.get("src", "")
 
-    # Categories / tags from post meta
+    # Download featured image
+    post_img_dir = IMAGES_DIR / slug
+    post_img_dir.mkdir(exist_ok=True)
+    featured_image_local = download_image(featured_image_url, post_img_dir)
+
+    # Download all inline images & rewrite content srcs
+    content_rewritten = download_all_images_in_content(content_html, slug, base_url=url)
+
+    # Categories / tags
     categories, tags = [], []
     for a in soup.select(".cat-links a, .entry-categories a"):
         categories.append(a.get_text(strip=True))
@@ -307,34 +447,31 @@ def scrape_post_page(html, url):
     if author_tag:
         author = author_tag.get_text(strip=True)
 
-    # Slug from URL
-    slug = url.rstrip("/").split("/")[-1]
-
     return {
-        "post_title":         title,
-        "post_content":       content_html,
-        "post_excerpt":       excerpt,
-        "post_date":          post_date,
-        "post_status":        "publish",
-        "post_name":          slug,
-        "post_author":        author,
-        "featured_image_url": featured_image,
-        "categories":         ", ".join(categories),
-        "tags":               ", ".join(tags),
-        "original_url":       normalise_url(url),
+        "post_title":            title,
+        "post_content":          content_rewritten,
+        "post_excerpt":          excerpt,
+        "post_date":             post_date,
+        "post_status":           "publish",
+        "post_name":             slug,
+        "post_author":           author,
+        "featured_image_url":    featured_image_url,
+        "featured_image_local":  featured_image_local,
+        "categories":            ", ".join(categories),
+        "tags":                  ", ".join(tags),
+        "original_url":          normalise_url(url),
     }
 
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main():
-    print(f"🚀 Vierling Lab Post Migrator")
-    print(f"   Source: {BASE}")
-    print(f"   Output: {OUTPUT_CSV}\n")
+    print("🚀 Vierling Lab Post Migrator  (with image download)")
+    print(f"   Source : {BASE}")
+    print(f"   Output : {OUTPUT_CSV}")
+    print(f"   Images : {IMAGES_DIR}/\n")
 
-    # Try API first; fall back to scraper
     posts = fetch_via_api()
-
     if not posts:
         posts = fetch_via_scraper()
 
@@ -344,7 +481,7 @@ def main():
 
     df = pd.DataFrame(posts)
 
-    # Deduplicate on slug (most stable unique key)
+    # Deduplicate on slug
     before = len(df)
     df.drop_duplicates(subset=["post_name"], keep="first", inplace=True)
     dupes = before - len(df)
@@ -355,22 +492,35 @@ def main():
     df.sort_values("post_date", inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    # Save — quoting=QUOTE_ALL ensures content HTML doesn't break CSV parsing
+    # Save CSV — QUOTE_ALL keeps HTML content safe
     df.to_csv(
         OUTPUT_CSV,
         index=False,
         quoting=csv.QUOTE_ALL,
-        encoding="utf-8-sig"        # BOM so Excel opens it cleanly too
+        encoding="utf-8-sig"
     )
 
-    print(f"\n✅ Saved {len(df)} posts → {OUTPUT_CSV}")
-    print(f"   Columns: {', '.join(df.columns)}")
+    # Log any failed image downloads
+    if failed_images:
+        with open("failed_images.txt", "w") as f:
+            f.write("\n".join(failed_images))
+        print(f"\n  ⚠ {len(failed_images)} images failed — saved to failed_images.txt")
 
-    # Quick sanity preview
-    print("\n── First 3 posts ──")
+    # Count downloaded images
+    total_imgs = sum(1 for _ in IMAGES_DIR.rglob("*") if _.is_file())
+
+    print(f"\n✅ Done!")
+    print(f"   Posts saved   : {len(df)}  →  {OUTPUT_CSV}")
+    print(f"   Images saved  : {total_imgs}  →  {IMAGES_DIR}/")
+    print(f"   Columns       : {', '.join(df.columns)}")
+
+    print("\n── Sample (first 3 posts) ──")
     for _, row in df.head(3).iterrows():
-        print(f"  [{row['post_date'][:10]}] {row['post_title'][:70]}")
-        print(f"    slug={row['post_name']}  image={'✓' if row['featured_image_url'] else '✗'}")
+        date  = str(row["post_date"])[:10]
+        title = str(row["post_title"])[:65]
+        img   = "✓" if row["featured_image_local"] else "✗"
+        print(f"  [{date}] {title}")
+        print(f"    slug={row['post_name']}  featured_img={img}")
 
 
 if __name__ == "__main__":
